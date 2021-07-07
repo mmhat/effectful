@@ -1,4 +1,7 @@
+{-# LANGUAGE MagicHash #-}
+{-# LANGUAGE UnboxedTuples #-}
 {-# LANGUAGE UndecidableInstances #-}
+{-# LANGUAGE UnliftedFFITypes #-}
 {-# OPTIONS_GHC -Wno-noncanonical-monad-instances #-}
 {-# OPTIONS_HADDOCK not-home #-}
 -- | The 'Eff' monad.
@@ -59,10 +62,13 @@ import Control.Monad.IO.Class
 import Control.Monad.IO.Unlift
 import Control.Monad.Trans.Control
 import Data.Unique
-import GHC.Magic (oneShot)
+import Foreign.C (CInt(..))
+import GHC.Conc (ThreadId(..))
+import GHC.Exts (ThreadId#, mkWeak#, oneShot)
+import GHC.IO (IO(..))
 import System.IO.Unsafe (unsafeDupablePerformIO)
 import qualified Control.Monad.Catch as E
-import qualified Data.Map.Strict as M
+import qualified Data.IntMap.Strict as IM
 
 import Effectful.Internal.Effect
 import Effectful.Internal.Env
@@ -148,20 +154,19 @@ boundedConcUnliftEff threads f = unsafeEff $ \es0 -> do
   esTemplate <- cloneEnv es0
   esMapVar <- do
     tid0 <- myThreadId
-    newMVar $ M.singleton tid0 es0
+    newMVar $ IM.singleton (mkEnvKey tid0) es0
   f $ \m -> do
     es <- modifyMVar esMapVar $ \esMap -> do
       tid <- myThreadId
-      case tid `M.lookup` esMap of
+      case mkEnvKey tid `IM.lookup` esMap of
         Just es -> pure (esMap, es)
-        Nothing -> case M.size esMap `compare` threads of
-          LT -> do
+        Nothing -> if IM.size esMap <= threads
+          then do
             es <- cloneEnv esTemplate
-            pure (M.insert tid es esMap, es)
-          EQ -> pure (M.insert tid esTemplate esMap, esTemplate)
-          GT -> error $ "Number of allowed threads to run with the unlifting "
-                     ++ "function exceeded. You have to increase the argument "
-                     ++ "to BoundedConcUnlift or use UnboundedConcUnlift."
+            (,es) <$> insertThreadEnv tid es esMap esMapVar
+          else error $ "Number of allowed threads to run with the unlifting "
+                    ++ "function exceeded. You have to increase the argument "
+                    ++ "to BoundedConcUnlift or use UnboundedConcUnlift."
     unEff m es
 
 -- | Lower 'Eff' operations into 'IO' ('UnboundedConcUnlift').
@@ -384,3 +389,22 @@ stateEffectM f = unsafeEff $ \es -> mask $ \release -> do
   unsafePutEnv e es
   pure a
 {-# INLINE stateEffectM #-}
+
+----------------------------------------
+-- Helpers and types for unlifting
+
+type EnvKey = Int
+
+mkEnvKey :: ThreadId -> EnvKey
+mkEnvKey (ThreadId t#) = fromIntegral (getThreadId t#)
+
+insertThreadEnv :: ThreadId -> Env es -> IM.IntMap (Env es) -> MVar (IM.IntMap (Env es)) -> IO (IM.IntMap (Env es))
+insertThreadEnv t@(ThreadId t#) es esMap esMapVar = do
+  IO $ \s -> case mkWeak# t# t finalizer s of
+    (# s1, _ #) -> (# s1, IM.insert (mkEnvKey t) es esMap #)
+  where
+    IO finalizer = modifyMVar esMapVar $ \esMap' ->
+      pure (IM.delete (mkEnvKey t) esMap', ())
+
+foreign import ccall unsafe "rts_getThreadId" getThreadId
+    :: ThreadId# -> CInt
